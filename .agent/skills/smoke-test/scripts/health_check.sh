@@ -1,125 +1,117 @@
-#!/usr/bin/env bash
-set +e
+#!/bin/bash
+# health_check.sh - Performs health checks on all running services
+# Verifies endpoints are responding and returning expected status codes
 
-echo "=========================================="
-echo "  Service Health Check"
-echo "=========================================="
-echo ""
+set -euo pipefail
 
-all_passed=true
-mode="${SMOKE_TEST_MODE:-auto}"
-summary_hint="make logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../../lib/common.sh" 2>/dev/null || true
 
-print_step() {
-    echo "$1"
-}
+# Default configuration
+BACKEND_HOST="${BACKEND_HOST:-localhost}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+FRONTEND_HOST="${FRONTEND_HOST:-localhost}"
+FRONTEND_PORT="${FRONTEND_PORT:-3000}"
+MAX_RETRIES="${MAX_RETRIES:-5}"
+RETRY_DELAY="${RETRY_DELAY:-3}"
+TIMEOUT="${TIMEOUT:-10}"
 
-check_http_status() {
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+PASS=0
+FAIL=0
+WARN=0
+
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# Check a single HTTP endpoint with retries
+check_endpoint() {
     local name="$1"
     local url="$2"
-    local expected_re="$3"
-    local status
+    local expected_status="${3:-200}"
+    local attempt=1
 
-    status="$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null)"
-    if echo "$status" | grep -Eq "$expected_re"; then
-        echo "✓ $name is accessible ($url -> $status)"
-    else
-        echo "✗ $name is not accessible ($url -> ${status:-000})"
-        all_passed=false
-    fi
+    while [ $attempt -le $MAX_RETRIES ]; do
+        local status
+        status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time "$TIMEOUT" \
+            --connect-timeout 5 \
+            "$url" 2>/dev/null || echo "000")
+
+        if [ "$status" = "$expected_status" ]; then
+            log_info "[$name] OK (HTTP $status) — $url"
+            PASS=$((PASS + 1))
+            return 0
+        fi
+
+        if [ $attempt -lt $MAX_RETRIES ]; then
+            log_warn "[$name] Attempt $attempt/$MAX_RETRIES failed (HTTP $status), retrying in ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    log_error "[$name] FAILED after $MAX_RETRIES attempts (last HTTP $status) — $url"
+    FAIL=$((FAIL + 1))
+    return 1
 }
 
-check_listen_port() {
+# Check if a port is open
+check_port() {
     local name="$1"
-    local port="$2"
+    local host="$2"
+    local port="$3"
 
-    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "✓ $name is listening on port $port"
+    if nc -z -w5 "$host" "$port" 2>/dev/null; then
+        log_info "[$name] Port $port is open on $host"
+        PASS=$((PASS + 1))
+        return 0
     else
-        echo "✗ $name is not listening on port $port"
-        all_passed=false
+        log_error "[$name] Port $port is NOT reachable on $host"
+        FAIL=$((FAIL + 1))
+        return 1
     fi
 }
 
-docker_available() {
-    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
-}
-
-detect_mode() {
-    case "$mode" in
-        local|docker)
-            echo "$mode"
-            return
-            ;;
-    esac
-
-    if docker_available && docker ps --format "{{.Names}}" | grep -q "deer-flow"; then
-        echo "docker"
-    else
-        echo "local"
-    fi
-}
-
-mode="$(detect_mode)"
-
-echo "Deployment mode: $mode"
-echo ""
-
-if [ "$mode" = "docker" ]; then
-    summary_hint="make docker-logs"
-    print_step "1. Checking container status..."
-    if docker ps --format "{{.Names}}" | grep -q "deer-flow"; then
-        echo "✓ Containers are running:"
-        docker ps --format "  - {{.Names}} ({{.Status}})"
-    else
-        echo "✗ No DeerFlow-related containers are running"
-        all_passed=false
-    fi
-else
-    summary_hint="logs/{langgraph,gateway,frontend,nginx}.log"
-    print_step "1. Checking local service ports..."
-    check_listen_port "Nginx" 2026
-    check_listen_port "Frontend" 3000
-    check_listen_port "Gateway" 8001
-    check_listen_port "LangGraph" 2024
-fi
-echo ""
-
-echo "2. Waiting for services to fully start (30 seconds)..."
-sleep 30
-echo ""
-
-echo "3. Checking frontend service..."
-check_http_status "Frontend service" "http://localhost:2026" "200|301|302|307|308"
-echo ""
-
-echo "4. Checking API Gateway..."
-health_response=$(curl -s http://localhost:2026/health 2>/dev/null)
-if [ $? -eq 0 ] && [ -n "$health_response" ]; then
-    echo "✓ API Gateway health check passed"
-    echo "  Response: $health_response"
-else
-    echo "✗ API Gateway health check failed"
-    all_passed=false
-fi
-echo ""
-
-echo "5. Checking LangGraph service..."
-check_http_status "LangGraph service" "http://localhost:2024/" "200|301|302|307|308|404"
-echo ""
-
-echo "=========================================="
-echo "  Health Check Summary"
-echo "=========================================="
-echo ""
-if [ "$all_passed" = true ]; then
-    echo "✅ All checks passed!"
+# Run all health checks
+run_health_checks() {
+    echo "====================================="
+    echo " DeerFlow Health Check"
+    echo " $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "====================================="
     echo ""
-    echo "🌐 Application URL: http://localhost:2026"
-    exit 0
-else
-    echo "❌ Some checks failed"
+
+    log_info "Checking backend service..."
+    check_port  "Backend TCP"    "$BACKEND_HOST"  "$BACKEND_PORT"
+    check_endpoint "Backend /health" \
+        "http://${BACKEND_HOST}:${BACKEND_PORT}/health" "200"
+    check_endpoint "Backend /api/v1/status" \
+        "http://${BACKEND_HOST}:${BACKEND_PORT}/api/v1/status" "200"
+
     echo ""
-    echo "Please review: $summary_hint"
-    exit 1
-fi
+    log_info "Checking frontend service..."
+    check_port  "Frontend TCP"   "$FRONTEND_HOST" "$FRONTEND_PORT"
+    check_endpoint "Frontend root" \
+        "http://${FRONTEND_HOST}:${FRONTEND_PORT}/" "200"
+
+    echo ""
+    echo "====================================="
+    echo " Results: PASS=$PASS  FAIL=$FAIL  WARN=$WARN"
+    echo "====================================="
+
+    if [ $FAIL -gt 0 ]; then
+        log_error "Health check FAILED ($FAIL checks did not pass)"
+        return 1
+    fi
+
+    log_info "All health checks passed!"
+    return 0
+}
+
+run_health_checks
